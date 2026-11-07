@@ -1,0 +1,19 @@
+# Segredos / configuração local
+.env
+.env.*
+!.env.example
+!.env.example.v0.4
+
+# Estado do relay (channels.json, admin_password)
+data/
+
+# Compose com IPs locais/Tailscale — use compose.example.yaml como base
+compose.yaml
+compose.override.yaml
+
+# Backups e caches
+*.bak
+*.bak-*
+*.bak.*
+__pycache__/
+*.pyc
