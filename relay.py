@@ -136,6 +136,7 @@ class Config:
     log_segments: bool = True
     max_channels: int = 8                 # channels that can be registered in /admin
     demand_idle_minutes: float = 20.0     # on-demand channels stop after this long without clients
+    slate_dir: str = ""                   # "please wait" video for on-demand channels; empty = off
 
     @classmethod
     def from_env(cls, env=None, require_source: bool = True) -> "Config":
@@ -186,6 +187,7 @@ class Config:
             log_segments=_bool(env, "LOG_SEGMENTS", True),
             max_channels=_num(env, "MAX_CHANNELS", 8, int, 1, 32),
             demand_idle_minutes=_num(env, "DEMAND_IDLE_MINUTES", 20.0, float, 1.0, 1440.0),
+            slate_dir=(env.get("SLATE_DIR") or "").strip(),
         )
         return cfg.normalize()
 
@@ -866,6 +868,10 @@ class Relay:
         self.bytes = 0
         self.next_local = int(time.time())   # monotonic across container restarts
         self.dseq = 0
+        self.slate = None                 # shown until the first real segment is published
+        self.slate_base = self.next_local
+        self.slate_head = None            # first sequence of the last slate playlist handed out
+        self.bridge = None                # (first real local_seq, real segments in the first playlist)
         self.last_committed = None
         self.recent_hashes = OrderedDict()
         self.release_started = False
@@ -1430,19 +1436,54 @@ class Relay:
             released = [s for s in self.store.values() if s.released_at is not None]
             window = released[-self.cfg.publish_window_segments:]
             if not window:
-                return None
+                return self._slate_playlist(now)
             first = window[0]
+            seq, dseq, prefix = first.local_seq, first.dseq, []
+            if self.slate_head is not None:
+                seq, dseq, prefix = self._bridge(window)
             out = ["#EXTM3U", "#EXT-X-VERSION:3", f"#EXT-X-TARGETDURATION:{self.target_out}",
-                   f"#EXT-X-MEDIA-SEQUENCE:{first.local_seq}",
-                   f"#EXT-X-DISCONTINUITY-SEQUENCE:{first.dseq}"]
+                   f"#EXT-X-MEDIA-SEQUENCE:{seq}",
+                   f"#EXT-X-DISCONTINUITY-SEQUENCE:{dseq}"] + prefix
             for i, seg in enumerate(window):
-                if i and seg.discontinuity:
+                if (i and seg.discontinuity) or (not i and prefix):
                     out.append("#EXT-X-DISCONTINUITY")
                 if seg.pdt:
                     out.append("#EXT-X-PROGRAM-DATE-TIME:" + seg.pdt)
                 out.append(f"#EXTINF:{seg.duration:.3f},")
                 out.append(f"/segment/{seg.name}.ts")
             return ("\n".join(out) + "\n").encode("utf-8")
+
+    def _slate_playlist(self, now: float):
+        slate = self.slate
+        if slate is None or now - self.started >= self.cfg.live_delay_seconds + SLATE_GRACE_SECONDS:
+            return None   # includes a dead origin: end in 503 instead of an endless slate
+        base = self.slate_base
+        first = base + int((now - self.started) / slate.duration)
+        self.slate_head = first
+        out = ["#EXTM3U", "#EXT-X-VERSION:3", f"#EXT-X-TARGETDURATION:{math.ceil(slate.duration)}",
+               f"#EXT-X-MEDIA-SEQUENCE:{first}",
+               f"#EXT-X-DISCONTINUITY-SEQUENCE:{slate.discontinuity(base, first)}"]
+        out += slate.lines(base, first, first + slate.WINDOW)
+        return ("\n".join(out) + "\n").encode("utf-8")
+
+    def _bridge(self, window):
+        """Sequence, discontinuity sequence and slate entries that lead into the real video.
+
+        Real segments continue the slate's numbering, and the slate entries leave the playlist
+        one per newly published segment, so a player already on the slate reaches the real video
+        through a marked discontinuity. Segment names keep the relay's own local_seq.
+        """
+        slate, head, base = self.slate, self.slate_head, self.slate_base
+        if self.bridge is None:
+            self.bridge = (window[0].local_seq, len(window))
+        start, initial = self.bridge
+        end = head + slate.WINDOW       # the real video's first sequence
+        dropped = window[-1].local_seq - start + 1 - initial
+        if dropped < slate.WINDOW and window[0].local_seq == start:
+            first = head + dropped
+            return first, slate.discontinuity(base, first), slate.lines(base, first, end)
+        return (window[0].local_seq - start + end,
+                window[0].dseq + slate.discontinuity(base, end - 1) + 1, [])
 
     _SEG_RE = re.compile(r"([0-9a-f]{6})-(\d{1,20})")
 
@@ -1686,6 +1727,69 @@ def cgroup_memory() -> dict:
     return out
 
 
+SLATE_GRACE_SECONDS = 120.0   # beyond the live delay: a dead origin must end in 503, not an endless slate
+
+
+class Slate:
+    """Pre-encoded "please wait" video, served while an on-demand channel fills its delay.
+
+    Each relay numbers it from its own start, so the real playlist can continue the same
+    sequence (see Relay._bridge) and players see one stream with a marked discontinuity.
+    """
+    WINDOW = 4
+    MAX_BYTES = 64 * 1024 * 1024
+
+    def __init__(self, directory: str):
+        with open(os.path.join(directory, "index.m3u8"), encoding="utf-8") as fh:
+            text = fh.read()
+        durations = [float(d) for d in re.findall(r"#EXTINF:([0-9.]+)", text)]
+        names = [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.startswith("#")]
+        if not names or len(names) != len(durations):
+            raise ValueError("index.m3u8 sem segmentos")
+        self.payloads = []
+        total = 0
+        for name in names:
+            with open(os.path.join(directory, os.path.basename(name)), "rb") as fh:
+                data = fh.read(self.MAX_BYTES - total + 1)
+            total += len(data)
+            if total > self.MAX_BYTES or data[:1] != b"\x47":
+                raise ValueError(f"segmento inválido ou grande demais: {name}")
+            self.payloads.append(data)
+        self.duration = sum(durations) / len(durations)
+        if self.duration <= 0:
+            raise ValueError("duração inválida")
+
+    @classmethod
+    def load(cls, directory: str):
+        """The slate is optional: any problem only logs and leaves the plain 503 behaviour."""
+        if not directory:
+            return None
+        try:
+            slate = cls(directory)
+        except (OSError, ValueError) as exc:
+            ev("slate_unavailable", logging.ERROR, path=directory, detail=safe_text(exc))
+            return None
+        ev("slate_loaded", path=directory, segments=len(slate.payloads), duration_s=slate.duration)
+        return slate
+
+    def discontinuity(self, base: int, seq: int) -> int:
+        """Loop restarts before `seq`, for a slate numbered from `base`."""
+        return (seq - base) // len(self.payloads)
+
+    def lines(self, base: int, start: int, stop: int) -> list:
+        count = len(self.payloads)
+        out = []
+        for seq in range(start, stop):
+            if seq > start and (seq - base) % count == 0:  # the loop restarts: timestamps jump back
+                out.append("#EXT-X-DISCONTINUITY")
+            out.append(f"#EXTINF:{self.duration:.3f},")
+            out.append(f"/slate/{(seq - base) % count}.ts")
+        return out
+
+    def segment(self, index: int):
+        return self.payloads[index] if index < len(self.payloads) else None
+
+
 class ChannelManager:
     """Owns the Relay instances. Channel settings (name, URL, on/off and a few
     per-channel overrides) persist in <state_dir>/channels.json; everything else comes
@@ -1704,6 +1808,7 @@ class ChannelManager:
         self.next_id = 1   # channel numbers are never reused: an old link must not hit another channel
         self.started_by = {}
         self.stop_event = threading.Event()
+        self.slate = Slate.load(base.slate_dir)
         self._load()
 
     @staticmethod
@@ -1864,7 +1969,10 @@ class ChannelManager:
                 raise ValueError("Defina a URL do canal antes de ligar")
             if slot in self.relays:
                 return False
-            relay = Relay(self.config_for(spec), channel=str(slot)).start()
+            relay = Relay(self.config_for(spec), channel=str(slot))
+            if spec.get("mode") == "on_demand":
+                relay.slate = self.slate
+            relay.start()
             self.relays[slot] = relay
             self.started_by[slot] = reason
             self.last_error.pop(slot, None)
@@ -2083,6 +2191,8 @@ input.url:focus,select:focus{outline:none;border-color:var(--acc)}
 .row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}
 .row2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 .idle-note{color:#9fb6ff;font-size:12px;display:none}
+.pinbox{display:flex;flex-direction:column;gap:5px;color:var(--muted);font-size:12px}
+button.pin{width:100%;padding:9px 10px}button.pin.on{background:#12351f;border-color:var(--ok);color:#7ee2a8}
 .stats{display:grid;grid-template-columns:repeat(6,1fr);gap:8px}
 .stat{background:var(--panel2);border-radius:9px;padding:7px 8px}
 .stat b{display:block;font-size:15px;font-variant-numeric:tabular-nums}.stat span{color:var(--muted);font-size:11px}
@@ -2119,7 +2229,7 @@ button.danger{color:#ffb4b2;border-color:#5a2524}
   <div class="toolbar"><button class="pri" id="addBtn">+ Adicionar canal</button><span class="count" id="count"></span></div>
   <div class="empty" id="empty" style="display:none">Nenhum canal cadastrado. Use "Adicionar canal".</div>
   <div class="grid" id="grid"></div>
-  <p class="note" style="margin-top:18px">O canal 1 também responde em <code>/live.m3u8</code> (endereço usado até a v0.4). Números de canais removidos não são reaproveitados. Mudar a URL, o atraso, as conexões ou o token de um canal ligado reinicia o canal e a reserva começa do zero.</p>
+  <p class="note" style="margin-top:18px">O canal 1 também responde em <code>/live.m3u8</code> (endereço usado até a v0.4). Números de canais removidos não são reaproveitados. Mudar a URL, o atraso, as conexões ou o "Fixar servidor" de um canal ligado reinicia o canal e a reserva começa do zero.</p>
 </main>
 <div id="login"><form id="loginForm"><div class="brand"><div class="logo">B</div><div>Relay de canais<br><small>Entrar no painel</small></div></div>
 <input type="password" id="pw" placeholder="Senha do painel" autocomplete="current-password" required>
@@ -2179,7 +2289,7 @@ function card(c) {
   <div class="row3">
     <label class="f">Atraso mínimo<select class="delay"></select></label>
     <label class="f">Conexões com a fonte<select class="par"></select></label>
-    <label class="f">Token da fonte<select class="tok"></select></label>
+    <div class="pinbox">Fixar servidor da fonte<button type="button" class="pin" title="Ligado: fica no mesmo servidor da fonte e só troca se ele der erro (evita lacunas quando a fonte alterna entre servidores). Desligado: volta à URL original a cada recarga (útil se a fonte usa token que expira rápido).">–</button></div>
   </div>
   <div class="prog"><div class="lbl"><span class="plbl">Enchendo reserva</span><span class="ptxt"></span></div><div class="bar"><i></i></div></div>
   <div class="stats">
@@ -2198,7 +2308,6 @@ function card(c) {
   const opt = (sel, items) => { for (const [v, t] of items) { const o = document.createElement('option'); o.value = v; o.textContent = t; sel.appendChild(o); } };
   opt($('.delay', el), [['', 'Padrão do .env (' + delayLabel(d.live_delay_seconds) + ')'], ['0', 'Sem atraso'], ['60', '1 minuto'], ['120', '2 minutos'], ['180', '3 minutos'], ['300', '5 minutos'], ['600', '10 minutos']]);
   opt($('.par', el), [['', 'Padrão do .env (' + (d.max_parallel_downloads ?? '–') + ')'], ['1', '1'], ['2', '2'], ['3', '3'], ['4', '4']]);
-  opt($('.tok', el), [['', 'Padrão do .env'], ['1', 'Renovar a cada recarga'], ['0', 'Renovar só após erro']]);
   opt($('.mode', el), [['always', 'Sempre ligado (liga/desliga no painel)'], ['on_demand', 'Sob demanda (liga quando alguém pedir)']]);
   opt($('.idle', el), [['', 'Padrão do .env (' + (d.idle_stop_minutes ?? 20) + ' min)'], ['5', '5 min'], ['10', '10 min'], ['20', '20 min'], ['30', '30 min'], ['60', '1 hora'], ['180', '3 horas']]);
   const syncIdle = () => { $('.idle', el).disabled = $('.mode', el).value !== 'on_demand'; };
@@ -2207,6 +2316,7 @@ function card(c) {
   el.querySelectorAll('input.name,input.url,select').forEach(i => { i.addEventListener('input', mark); i.addEventListener('change', mark); });
   $('.save', el).onclick = () => save(c.slot);
   $('.toggle', el).onclick = () => toggle(c.slot);
+  $('.pin', el).onclick = () => togglePin(c.slot);
   $('.restart', el).onclick = () => act(c.slot, 'restart', 'Reiniciar o canal? A reserva começa do zero.');
   $('.remove', el).onclick = () => removeChannel(c.slot);
   $('.copy', el).onclick = () => { const i = $('.addr', el); i.select();
@@ -2223,7 +2333,6 @@ function fillForm(el, c) {
     const o = document.createElement('option'); o.value = String(Math.round(c.live_delay_seconds));
     o.textContent = delayLabel(c.live_delay_seconds); $('.delay', el).appendChild(o); $('.delay', el).value = o.value; }
   $('.par', el).value = c.max_parallel_downloads == null ? '' : String(c.max_parallel_downloads);
-  $('.tok', el).value = c.master_refresh_seconds == null ? '' : (c.master_refresh_seconds > 0 ? '1' : '0');
   $('.mode', el).value = c.mode || 'always';
   $('.idle', el).value = c.idle_stop_minutes == null ? '' : String(Math.round(c.idle_stop_minutes));
   if (!$('.idle', el).value && c.idle_stop_minutes != null) {
@@ -2261,6 +2370,8 @@ function update(el, c) {
     else { const idle = m.idle_seconds || 0;
       note.textContent = (m.clients ? `Sob demanda: ${m.clients} cliente(s) assistindo.` : `Sob demanda: sem clientes há ${fmtS(idle)}; desliga em ${fmtS(Math.max(0, lim * 60 - idle))}.`) + (c.started_by === 'demand' ? ' Ligado por pedido.' : ''); }
   } else note.style.display = 'none';
+  const pin = $('.pin', el), pinned = isPinned(c);
+  pin.textContent = pinned ? 'Ligado' : 'Desligado'; pin.classList.toggle('on', pinned); pin.disabled = !!busy[c.slot];
   $('.restart', el).disabled = !c.running || busy[c.slot];
   $('.save', el).disabled = t.disabled = $('.remove', el).disabled = !!busy[c.slot];
   $('.err', el).textContent = c.error ? 'Erro: ' + c.error : '';
@@ -2305,13 +2416,12 @@ function formOf(slot) {
   return {name: v('.name'), url: v('.url').trim(),
     live_delay_seconds: v('.delay') === '' ? null : Number(v('.delay')),
     max_parallel_downloads: v('.par') === '' ? null : Number(v('.par')),
-    master_refresh_seconds: v('.tok') === '' ? null : Number(v('.tok')),
     mode: v('.mode'), idle_stop_minutes: v('.idle') === '' ? null : Number(v('.idle'))};
 }
 async function run(slot, fn) { busy[slot] = true; render(); try { await fn(); } catch (e) { if (e.message !== 'auth') toast(e.message, true); } finally { busy[slot] = false; await refresh(); } }
 async function save(slot) {
   const f = formOf(slot), c = chan(slot);
-  const runtime = ['url', 'live_delay_seconds', 'max_parallel_downloads', 'master_refresh_seconds'].some(k => (f[k] ?? null) !== (c[k] ?? null));
+  const runtime = ['url', 'live_delay_seconds', 'max_parallel_downloads'].some(k => (f[k] ?? null) !== (c[k] ?? null));
   if (c.running && runtime && !confirm('Salvar vai reiniciar o canal ' + slot + ' e a reserva começa do zero. Continuar?')) return;
   await run(slot, async () => {
     const r = await api('/api/channels/' + slot, {method: 'POST', body: JSON.stringify(f)});
@@ -2327,6 +2437,15 @@ async function toggle(slot) {
   if (c.running) return act(slot, 'stop', 'Desligar o canal ' + slot + '? Quem estiver assistindo perde o sinal.');
   if (dirty[slot]) { await run(slot, () => api('/api/channels/' + slot, {method: 'POST', body: JSON.stringify(formOf(slot))}).then(() => { dirty[slot] = false; })); }
   return act(slot, 'start');
+}
+const isPinned = c => (c.master_refresh_seconds ?? (data.defaults || {}).master_refresh_seconds) === 0;
+async function togglePin(slot) {
+  const c = chan(slot), on = !isPinned(c);
+  if (c.running && !confirm('Isso vai reiniciar o canal ' + slot + ' e a reserva começa do zero. Continuar?')) return;
+  await run(slot, async () => {
+    const r = await api('/api/channels/' + slot, {method: 'POST', body: JSON.stringify({master_refresh_seconds: on ? 0 : 1})});
+    toast('Fixar servidor ' + (on ? 'ligado' : 'desligado') + (r.restarted ? '. Canal reiniciado.' : '.'));
+  });
 }
 async function addChannel() {
   $('#addBtn').disabled = true;
@@ -2383,6 +2502,7 @@ class RelayHTTPServer(ThreadingHTTPServer):
 
 
 _CH_RE = re.compile(r"/ch/(\d{1,4})/(live\.m3u8|live\.m3u|health)")
+_SLATE_RE = re.compile(r"/slate/(\d{1,4})\.ts")
 _API_RE = re.compile(r"/api/channels/(\d{1,4})(?:/(start|stop|restart|delete))?")
 
 
@@ -2506,6 +2626,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._playlist(slot, head)
         if path == "/health":
             return self._health(1, head, with_channels=True)
+        match = _SLATE_RE.fullmatch(path)
+        if match:
+            slate = self.server.manager.slate
+            data = slate.segment(int(match.group(1))) if slate else None
+            if data is None:
+                return self._send(404, b"Unknown slate segment\n", "text/plain", head)
+            return self._send(200, data, "video/mp2t", head, cache="max-age=600")
         if path.startswith("/segment/") and path.endswith(".ts"):
             return self._segment(path[len("/segment/"):-3], head)
         if path == "/favicon.ico":

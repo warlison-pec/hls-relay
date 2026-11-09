@@ -18,7 +18,7 @@ fonte de um cair, os outros seguem normalmente.
 
 | Endereço | O que é |
 |---|---|
-| `http://IP:8099/admin` | **painel**: adicionar e remover canais; nome, URL, atraso, conexões e token de cada um; ligar, desligar e reiniciar |
+| `http://IP:8099/admin` | **painel**: adicionar e remover canais; nome, URL, atraso, conexões e "Fixar servidor" de cada um; ligar, desligar e reiniciar |
 | `http://IP:8099/live.m3u8` | canal 1 (o mesmo endereço da v0.4: o Dispatcharr não precisa mudar) |
 | `http://IP:8099/ch/N/live.m3u8` | canal N (o número aparece no cartão do canal) |
 | `http://IP:8099/ch/N/health` | métricas do canal N |
@@ -30,7 +30,7 @@ fonte de um cair, os outros seguem normalmente.
   Trocar o `HLS_SOURCE_URL` no `.env` não muda mais o canal 1.
 - Os ajustes gerais (atraso padrão, conexões padrão, `MASTER_REFRESH_SECONDS`, `MAX_CACHE_MB`
   etc.) continuam vindo do `.env`. No painel, cada canal pode usar o padrão ou um valor próprio.
-- Salvar uma URL, atraso, conexões ou token diferente **num canal ligado reinicia o canal**, e a
+- Salvar uma URL, atraso ou conexões diferentes, ou clicar em "Fixar servidor", **num canal ligado reinicia o canal**, e a
   reserva começa do zero (o painel pede confirmação). Mudar só o nome não reinicia nada.
 - **Adicionar canal** cria um cartão novo (desligado). Preencha a URL, salve e ligue.
   **Remover** desliga o canal e apaga o cadastro. O número de um canal removido **nunca é
@@ -51,6 +51,13 @@ fonte de um cair, os outros seguem normalmente.
   - No Dispatcharr, a primeira tentativa num canal em espera pode estourar o tempo de partida dele
     (Channel Initialization Timeout, 60 s por padrão), mas o pedido já ligou o canal: tente de
     novo depois que a reserva encher.
+  - **Tela de "aguarde" (opcional, desligada por padrão):** gere o vídeo com
+    `bash scripts/make_slate.sh -t "Canal iniciando" -s "Aguarde o carregamento..."` (ou `-i imagem.png`),
+    monte a pasta `./slate` em `/slate:ro` no compose e defina `SLATE_DIR=/slate` no `.env`. Enquanto a
+    reserva enche, o canal sob demanda toca esse vídeo em vez de responder `503`, e passa sozinho para o
+    canal real. Se a fonte não entregar em `atraso + 120 s`, volta ao `503`. Canais "Sempre ligado" não
+    mudam. O áudio do vídeo é AAC: em canais com áudio AC-3, clientes baseados em ffmpeg podem perder o
+    som após a troca.
 - Canal desligado não consome nada: nenhuma conexão com a fonte, nenhuma memória. A
   `/ch/N/live.m3u8` dele responde `503 Canal N desligado`.
 - Os canais que estavam ligados voltam ligados quando o container reinicia.

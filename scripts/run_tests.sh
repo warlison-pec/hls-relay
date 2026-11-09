@@ -7,6 +7,8 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 python3 -m py_compile relay.py
 python3 -I tests/test_relay_v04.py -v
 python3 -I tests/test_multichannel.py -v
+python3 -I tests/test_slate.py -v SlateTests
 if [ "${1:-}" != "--quick" ]; then
+  python3 -I tests/test_slate.py -v SlateEndToEnd
   python3 -I tests/test_e2e_ffmpeg.py -v
 fi

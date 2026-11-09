@@ -10,6 +10,7 @@ services:
       # - "SEU_IP_LAN_OU_TAILSCALE:8099:8099"
     volumes:
       - ./data:/data
+      # - ./slate:/slate:ro   # tela de "aguarde" (scripts/make_slate.sh + SLATE_DIR=/slate)
     environment:
       RELAY_STATE_DIR: /data
     mem_limit: 2g

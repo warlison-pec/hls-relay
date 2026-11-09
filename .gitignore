@@ -11,6 +11,9 @@ data/
 compose.yaml
 compose.override.yaml
 
+# Tela de "aguarde" gerada por scripts/make_slate.sh
+slate/
+
 # Backups e caches
 *.bak
 *.bak-*
