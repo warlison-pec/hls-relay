@@ -58,6 +58,10 @@ fonte de um cair, os outros seguem normalmente.
     canal real. Se a fonte não entregar em `atraso + 120 s`, volta ao `503`. Canais "Sempre ligado" não
     mudam. O áudio do vídeo é AAC: em canais com áudio AC-3, clientes baseados em ffmpeg podem perder o
     som após a troca.
+    O relay acerta o relógio (timestamps) do vídeo de "aguarde" pelo do canal real, para que a troca não
+    congele a imagem em clientes que remuxam com ffmpeg (Dispatcharr), e começa o canal no segmento que
+    continua esse relógio (log `event=slate_switch aligned=True`). O vídeo sai por padrão em 1080p a
+    29,97 fps, como os canais; para outra fonte use `-S LARGURAxALTURA -r FPS`.
 - Canal desligado não consome nada: nenhuma conexão com a fonte, nenhuma memória. A
   `/ch/N/live.m3u8` dele responde `503 Canal N desligado`.
 - Os canais que estavam ligados voltam ligados quando o container reinicia.

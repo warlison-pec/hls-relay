@@ -132,8 +132,8 @@ def synthetic_timeline(count: int, duration: float, start_seq: int = 0, pts_star
 
 def ffmpeg_timeline(count: int, hls_time: float = 1.0, size: str = "320x180",
                     pts_offset: float = 0.0, start_seq: int = 0, tag: str = "a",
-                    gop_seconds: float | None = None) -> list:
-    """Real H.264 + AC-3 segments produced by ffmpeg (keyframe aligned)."""
+                    gop_seconds: float | None = None, audio: str = "ac3") -> list:
+    """Real H.264 + AC-3 (or `audio`) segments produced by ffmpeg (keyframe aligned)."""
     if not shutil.which("ffmpeg"):
         raise RuntimeError("ffmpeg not available")
     gop = int(round((gop_seconds or hls_time) * 25))
@@ -144,7 +144,7 @@ def ffmpeg_timeline(count: int, hls_time: float = 1.0, size: str = "320x180",
                "-f", "lavfi", "-i", f"sine=frequency=440:sample_rate=48000:duration={count * hls_time + 1}",
                "-c:v", "libx264", "-preset", "ultrafast", "-g", str(gop), "-keyint_min", str(gop),
                "-sc_threshold", "0", "-pix_fmt", "yuv420p",
-               "-c:a", "ac3", "-b:a", "96k",
+               "-c:a", audio, "-b:a", "96k",
                "-output_ts_offset", str(pts_offset),
                "-f", "hls", "-hls_time", str(hls_time), "-hls_list_size", "0",
                "-hls_segment_filename", os.path.join(work, "seg%04d.ts"),

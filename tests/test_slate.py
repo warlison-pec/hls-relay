@@ -163,7 +163,8 @@ class SlateTests(Base):
         text = relay.playlist().decode()
         self.assertEqual(seq_of(text), relay.slate_base + 2)
         self.assertEqual(dseq_of(text), 0)
-        self.assertEqual(re.findall(r"/slate/(\d+)\.ts", text), ["2", "0", "1", "2"])
+        self.assertEqual(re.findall(r"/slate/[0-9a-f]{6}-(\d+)\.ts", text),
+                         [str(relay.slate_base + i) for i in (2, 3, 4, 5)])
         self.assertEqual(text.count("#EXT-X-DISCONTINUITY\n"), 1)
         now[0] = 18.0
         self.assertEqual(dseq_of(relay.playlist().decode()), 1)
@@ -171,6 +172,35 @@ class SlateTests(Base):
     def test_unknown_segment_is_404(self):
         self.serve(self.dir)
         self.assertEqual(self.get("/slate/99.ts")[0], 404)
+        self.assertEqual(self.get("/slate/abcdef-5.ts")[0], 404)
+
+    def test_shift_ts_moves_every_timestamp_and_wraps(self):
+        near_wrap = r.PTS_WRAP - 90000                      # one second before the 33-bit wrap
+        seg = sim.make_segment(near_wrap, 2.0)
+        before = r.inspect_ts(seg)
+        shifted = r.shift_ts(seg, 3 * 90000)
+        after = r.inspect_ts(shifted)
+        self.assertTrue(after.ok)
+        self.assertEqual(len(shifted), len(seg))
+        self.assertEqual(after.min_pts, (before.min_pts + 3 * 90000) % r.PTS_WRAP)
+        self.assertEqual(after.max_pts, (before.max_pts + 3 * 90000) % r.PTS_WRAP)
+        self.assertEqual(r.shift_ts(shifted, r.PTS_WRAP - 3 * 90000), seg)   # and back, bit for bit
+
+    def test_bridge_starts_where_the_slate_clock_is(self):
+        relay = r.Relay(make_cfg("http://127.0.0.1:1/x.m3u8", live_delay_seconds=30.0, live_delay_max_seconds=40.0))
+        relay.slate = r.Slate(self.dir)                     # 3 segments of 6 s
+        relay.slate_head = relay.slate_base + 10
+        end = relay.slate_head + relay.slate.WINDOW
+        slate_end = 1_000_000 * 90000
+        relay.slate_anchor = (slate_end - round((end - relay.slate_base) * 6.0 * 90000)) % r.PTS_WRAP
+        window = []
+        for i in range(6):   # real segments of 5 s around the slate's end
+            start = slate_end + round((i - 3) * 5.0 * 90000) + 2 * 90000
+            window.append(r.Stored(100 + i, f"x-{100 + i}", b"", 5.0, False, 0, 0, i, None, 0.0,
+                                   released_at=0.0, min_pts=start % r.PTS_WRAP))
+        self.assertEqual(relay._bridge_start(window, end), 102)   # 3 s back; 2 s ahead would be a forward jump
+        relay.slate_anchor = False
+        self.assertEqual(relay._bridge_start(window, end), 100)   # unaligned: old behaviour
 
 
 @unittest.skipUnless(HAVE_FFMPEG, "ffmpeg not installed")
@@ -194,6 +224,32 @@ class SlateEndToEnd(Base):
         self.assertEqual(proc.returncode, 0)
         self.assertGreater(stats["segment_requests"], 5, "client never reached the real video")
         self.assertEqual(stats["segment_404"], 0)
+
+    def test_remuxing_client_gets_one_continuous_clock(self):
+        """Dispatcharr-style client: ffmpeg -c copy into one MPEG-TS. The origin's clock is
+        far from the slate's (as on real channels); the switch must not jump the video clock."""
+        work = tempfile.mkdtemp(prefix="slate-e2e-")
+        self.addCleanup(shutil.rmtree, work, True)
+        subprocess.run(["bash", str(ROOT / "scripts/make_slate.sh"), "-o", work, "-S", "320x180", "-r", "25"],
+                       check=True, capture_output=True)
+        self.serve(work, sim.ffmpeg_timeline(70, hls_time=1.0, pts_offset=50000.0, audio="aac"),
+                   live_delay_seconds=6.0, live_delay_max_seconds=10.0, min_start_segments=3)
+        slot = self.channel("on_demand")
+        out = str(Path(work) / "client.ts")
+        cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-i", self.url(f"/ch/{slot}/live.m3u8"),
+               "-t", "35", "-c", "copy", "-f", "mpegts", out]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        relay = self.manager.relays[slot]
+        self.assertIs(type(relay.slate_anchor), int, "slate was not aligned")
+        stats = next(iter(relay.clients.values()))
+        self.assertGreater(stats["segment_requests"], 5, "client never reached the real video")
+        probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                                "packet=dts_time", "-of", "csv=p=0", out], capture_output=True, text=True)
+        dts = [float(x) for x in (ln.split(",")[0] for ln in probe.stdout.split()) if x not in ("", "N/A")]
+        jumps = [(a, b) for a, b in zip(dts, dts[1:]) if abs(b - a) > 2.0]
+        print(f"\n[e2e remux] video packets={len(dts)} span={dts[-1] - dts[0]:.1f}s jumps={jumps[:3]}")
+        self.assertEqual(jumps, [], "video clock jumped at the slate/real switch")
 
 
 if __name__ == "__main__":

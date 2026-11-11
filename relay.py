@@ -678,6 +678,49 @@ def pts_delta(a: int, b: int) -> float:
     return d / 90000.0
 
 
+def _write_pts(buf, i: int, value: int):
+    buf[i] = (buf[i] & 0xF0) | (((value >> 30) & 0x07) << 1) | 1
+    buf[i + 1] = (value >> 22) & 0xFF
+    buf[i + 2] = (((value >> 15) & 0x7F) << 1) | 1
+    buf[i + 3] = (value >> 7) & 0xFF
+    buf[i + 4] = ((value & 0x7F) << 1) | 1
+
+
+def shift_ts(data: bytes, shift: int) -> bytes:
+    """Copy of an MPEG-TS buffer with every PCR, PTS and DTS moved by `shift` (90 kHz)."""
+    out = bytearray(data)
+    for off in range(0, len(out) - 187, 188):
+        if out[off] != 0x47:
+            continue
+        b1 = out[off + 1]
+        pid = ((b1 & 0x1F) << 8) | out[off + 2]
+        afc = (out[off + 3] >> 4) & 0x03
+        p = off + 4
+        if afc & 0x02:
+            alen = out[p]
+            if alen >= 7 and out[p + 1] & 0x10:
+                q = p + 2
+                pcr = (out[q] << 25) | (out[q + 1] << 17) | (out[q + 2] << 9) | (out[q + 3] << 1) | (out[q + 4] >> 7)
+                pcr = (pcr + shift) % PTS_WRAP
+                out[q], out[q + 1] = (pcr >> 25) & 0xFF, (pcr >> 17) & 0xFF
+                out[q + 2], out[q + 3] = (pcr >> 9) & 0xFF, (pcr >> 1) & 0xFF
+                out[q + 4] = ((pcr & 1) << 7) | (out[q + 4] & 0x7F)
+            p += 1 + alen
+        if not afc & 0x01 or not b1 & 0x40 or pid in (0, 0x1FFF) or p + 14 > off + 188:
+            continue
+        if out[p:p + 3] != b"\x00\x00\x01":
+            continue
+        sid = out[p + 3]
+        if not (0xC0 <= sid <= 0xEF or sid == 0xBD):
+            continue
+        flags = out[p + 7] >> 6
+        if flags & 0x02:
+            _write_pts(out, p + 9, (_read_pts(out[p + 9:p + 14]) + shift) % PTS_WRAP)
+        if flags == 0x03 and p + 19 <= off + 188:
+            _write_pts(out, p + 14, (_read_pts(out[p + 14:p + 19]) + shift) % PTS_WRAP)
+    return bytes(out)
+
+
 def _nal_types(es: bytes, codec: str | None) -> set:
     types = set()
     i = es.find(b"\x00\x00\x01")
@@ -831,6 +874,7 @@ class Stored:
     released_at: float | None = None
     left_window_at: float | None = None
     max_pts: int | None = None
+    min_pts: int | None = None
 
 
 class Relay:
@@ -872,6 +916,8 @@ class Relay:
         self.slate_base = self.next_local
         self.slate_head = None            # first sequence of the last slate playlist handed out
         self.bridge = None                # (first real local_seq, real segments in the first playlist)
+        self.slate_anchor = None          # 90 kHz PTS given to slate_base; None = not yet, False = unaligned
+        self.slate_cache = OrderedDict()  # (index, loop) -> slate payload with shifted timestamps
         self.last_committed = None
         self.recent_hashes = OrderedDict()
         self.release_started = False
@@ -1274,7 +1320,7 @@ class Relay:
         self.next_local += 1
         seg = Stored(local, f"{self.instance}-{local}", job.payload, job.duration, discontinuity,
                      self.dseq, job.epoch, job.seq, job.pdt, now,
-                     max_pts=info.max_pts if info else None)
+                     max_pts=info.max_pts if info else None, min_pts=info.min_pts if info else None)
         self.store[local] = seg
         self.bytes += len(job.payload)
         self.last_committed = {"epoch": job.epoch, "seq": job.seq, "duration": job.duration,
@@ -1440,7 +1486,7 @@ class Relay:
             first = window[0]
             seq, dseq, prefix = first.local_seq, first.dseq, []
             if self.slate_head is not None:
-                seq, dseq, prefix = self._bridge(window)
+                seq, dseq, prefix, window = self._bridge(window)
             out = ["#EXTM3U", "#EXT-X-VERSION:3", f"#EXT-X-TARGETDURATION:{self.target_out}",
                    f"#EXT-X-MEDIA-SEQUENCE:{seq}",
                    f"#EXT-X-DISCONTINUITY-SEQUENCE:{dseq}"] + prefix
@@ -1463,7 +1509,7 @@ class Relay:
         out = ["#EXTM3U", "#EXT-X-VERSION:3", f"#EXT-X-TARGETDURATION:{math.ceil(slate.duration)}",
                f"#EXT-X-MEDIA-SEQUENCE:{first}",
                f"#EXT-X-DISCONTINUITY-SEQUENCE:{slate.discontinuity(base, first)}"]
-        out += slate.lines(base, first, first + slate.WINDOW)
+        out += slate.lines(base, first, first + slate.WINDOW, self.instance)
         return ("\n".join(out) + "\n").encode("utf-8")
 
     def _bridge(self, window):
@@ -1474,16 +1520,110 @@ class Relay:
         through a marked discontinuity. Segment names keep the relay's own local_seq.
         """
         slate, head, base = self.slate, self.slate_head, self.slate_base
-        if self.bridge is None:
-            self.bridge = (window[0].local_seq, len(window))
-        start, initial = self.bridge
         end = head + slate.WINDOW       # the real video's first sequence
+        if self.bridge is None:
+            start = self._bridge_start(window, end)
+            self.bridge = (start, sum(1 for s in window if s.local_seq >= start))
+        start, initial = self.bridge
+        window = [s for s in window if s.local_seq >= start]
         dropped = window[-1].local_seq - start + 1 - initial
         if dropped < slate.WINDOW and window[0].local_seq == start:
             first = head + dropped
-            return first, slate.discontinuity(base, first), slate.lines(base, first, end)
+            return (first, slate.discontinuity(base, first),
+                    slate.lines(base, first, end, self.instance), window)
         return (window[0].local_seq - start + end,
-                window[0].dseq + slate.discontinuity(base, end - 1) + 1, [])
+                window[0].dseq + slate.discontinuity(base, end - 1) + 1, [], window)
+
+    def _bridge_start(self, window, end: int) -> int:
+        """First real segment after the slate: the one whose timestamps continue the slate's.
+
+        Players behind an ffmpeg remux (Dispatcharr) freeze the picture on a big forward
+        timestamp jump, so the slate is timed to end inside the published window
+        (see slate_payload) and the real video starts where the slate's clock is.
+        """
+        anchor, slate = self.slate_anchor, self.slate
+        if type(anchor) is not int:
+            return window[0].local_seq
+        slate_end = (anchor + round((end - self.slate_base) * slate.duration * 90000)) % PTS_WRAP
+        best = ahead = None
+        for seg in window:
+            if seg.min_pts is None:
+                continue
+            back = pts_delta(slate_end, seg.min_pts)   # seconds the clock goes back at the switch
+            if 0.0 <= back <= SLATE_MAX_REWIND_SECONDS:
+                best = (seg, back)                     # remuxers absorb a small step back
+            elif -1.0 <= back < 0.0 and ahead is None:
+                ahead = (seg, back)                    # a step forward only pauses briefly
+        best = best or ahead
+        if best is None:
+            gap = pts_delta(window[0].min_pts, slate_end) if window[0].min_pts is not None else None
+            self._ev("slate_switch", logging.WARNING, aligned=False,
+               jump_s=round(gap, 1) if gap is not None else None)
+            return window[0].local_seq
+        seg, back = best
+        self._ev("slate_switch", aligned=True, rewind_s=round(back, 2),
+           skipped=sum(1 for s in window if s.local_seq < seg.local_seq))
+        return seg.local_seq
+
+    def _slate_anchor(self, now: float):
+        """PTS for slate_base, chosen so that the slate ends where the real video starts.
+
+        The first real segment to be published is the oldest one stored (P0). Publication
+        starts once the origin has produced the live delay plus MIN_START_SEGMENTS after P0;
+        the slate is timed to reach P0 (+ SLATE_LEAD_SECONDS) at that moment. If it starts
+        later, the switch picks a later real segment (see _bridge_start)."""
+        if self.slate_anchor is not None:
+            return self.slate_anchor
+        first = next((s for s in self.store.values() if s.epoch == self.epoch), None)
+        if first is None or first.min_pts is None or self.high_seq is None:
+            return None
+        cfg, slate, dur = self.cfg, self.slate, first.duration
+        listed = (self.high_seq - first.source_seq + 1.5) * dur   # origin video after P0 (+half a segment since listed)
+        if cfg.live_delay_seconds > 0:
+            needed = cfg.live_delay_seconds + cfg.min_start_segments * dur
+        else:
+            needed = (cfg.start_behind_segments + cfg.min_start_segments) * dur
+        publish_at = (now - self.started) + max(0.0, needed - listed)
+        target = first.min_pts / 90000.0 + SLATE_LEAD_SECONDS - publish_at - slate.WINDOW * slate.duration
+        self.slate_anchor = round(target * 90000) % PTS_WRAP
+        self._ev("slate_aligned", listed_s=round(listed, 1), publish_in_s=round(max(0.0, needed - listed), 1))
+        return self.slate_anchor
+
+    def slate_payload(self, seq: int, wait: float | None = None):
+        """Slate segment for sequence `seq`, its timestamps moved onto the channel's clock.
+
+        Called without the lock: it may wait a few seconds for the first real segment,
+        which is what the slate's clock is derived from."""
+        slate = self.slate
+        offset = seq - self.slate_base
+        if slate is None or not 0 <= offset < 1_000_000:
+            return None
+        count = len(slate.payloads)
+        index, loop = offset % count, offset // count
+        if slate.first_pts is None:
+            return slate.payloads[index]
+        deadline = time.monotonic() + (SLATE_ALIGN_WAIT_SECONDS if wait is None else wait)
+        while True:
+            with self.lock:
+                anchor = self._slate_anchor(self.clock())
+            if anchor is not None or time.monotonic() >= deadline or self.stop_event.is_set():
+                break
+            time.sleep(0.1)
+        with self.lock:
+            if self.slate_anchor is None:
+                self.slate_anchor = False
+                self._ev("slate_unaligned", logging.WARNING, detail="no real segment in time; plain slate")
+            anchor = self.slate_anchor
+            if anchor is False:
+                return slate.payloads[index]
+            data = self.slate_cache.get((index, loop))
+            if data is None:
+                shift = (anchor + round(loop * count * slate.duration * 90000) - slate.first_pts) % PTS_WRAP
+                data = shift_ts(slate.payloads[index], shift)
+                self.slate_cache[(index, loop)] = data
+                while len(self.slate_cache) > 8:
+                    self.slate_cache.popitem(last=False)
+            return data
 
     _SEG_RE = re.compile(r"([0-9a-f]{6})-(\d{1,20})")
 
@@ -1728,6 +1868,9 @@ def cgroup_memory() -> dict:
 
 
 SLATE_GRACE_SECONDS = 120.0   # beyond the live delay: a dead origin must end in 503, not an endless slate
+SLATE_LEAD_SECONDS = 2.0      # the slate is timed to end this far into the first real segment
+SLATE_MAX_REWIND_SECONDS = 45.0  # ffmpeg remuxers absorb backward jumps up to ~60 s, forward ones only < 10 s
+SLATE_ALIGN_WAIT_SECONDS = 8.0   # a slate request waits this long for the first real segment
 
 
 class Slate:
@@ -1758,6 +1901,7 @@ class Slate:
         self.duration = sum(durations) / len(durations)
         if self.duration <= 0:
             raise ValueError("duração inválida")
+        self.first_pts = inspect_ts(self.payloads[0]).min_pts   # None: timestamps are left alone
 
     @classmethod
     def load(cls, directory: str):
@@ -1776,14 +1920,14 @@ class Slate:
         """Loop restarts before `seq`, for a slate numbered from `base`."""
         return (seq - base) // len(self.payloads)
 
-    def lines(self, base: int, start: int, stop: int) -> list:
+    def lines(self, base: int, start: int, stop: int, instance: str) -> list:
         count = len(self.payloads)
         out = []
         for seq in range(start, stop):
-            if seq > start and (seq - base) % count == 0:  # the loop restarts: timestamps jump back
+            if seq > start and (seq - base) % count == 0:  # the loop restarts (unaligned: timestamps jump back)
                 out.append("#EXT-X-DISCONTINUITY")
             out.append(f"#EXTINF:{self.duration:.3f},")
-            out.append(f"/slate/{(seq - base) % count}.ts")
+            out.append(f"/slate/{instance}-{seq}.ts")
         return out
 
     def segment(self, index: int):
@@ -2503,6 +2647,7 @@ class RelayHTTPServer(ThreadingHTTPServer):
 
 _CH_RE = re.compile(r"/ch/(\d{1,4})/(live\.m3u8|live\.m3u|health)")
 _SLATE_RE = re.compile(r"/slate/(\d{1,4})\.ts")
+_SLATE_SEQ_RE = re.compile(r"/slate/([0-9a-f]{6})-(\d{1,20})\.ts")
 _API_RE = re.compile(r"/api/channels/(\d{1,4})(?:/(start|stop|restart|delete))?")
 
 
@@ -2630,6 +2775,13 @@ class Handler(BaseHTTPRequestHandler):
         if match:
             slate = self.server.manager.slate
             data = slate.segment(int(match.group(1))) if slate else None
+            if data is None:
+                return self._send(404, b"Unknown slate segment\n", "text/plain", head)
+            return self._send(200, data, "video/mp2t", head, cache="max-age=600")
+        match = _SLATE_SEQ_RE.fullmatch(path)
+        if match:
+            relay = self.server.manager.by_instance(match.group(1))
+            data = relay.slate_payload(int(match.group(2))) if relay else None
             if data is None:
                 return self._send(404, b"Unknown slate segment\n", "text/plain", head)
             return self._send(200, data, "video/mp2t", head, cache="max-age=600")
