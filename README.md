@@ -16,6 +16,17 @@ O relay agora mantém **vários canais** (sem limite de cadastro por padrão; `M
 recomposição, validação de segmentos e renovação de token. Os canais são independentes: se a
 fonte de um cair, os outros seguem normalmente.
 
+> [!WARNING]
+> **Sem limite de cadastro não quer dizer sem limite de uso.** O que pesa são os canais **ligados ao
+> mesmo tempo**, não os cadastrados. Cada canal ligado guarda vídeo em memória: com 30 s de atraso e
+> ~4 Mbit/s, ficam uns 100–150 MB por canal (bem mais com atrasos longos, veja a tabela de memória abaixo).
+> Se a soma passar do `mem_limit` do container, ele é encerrado pelo Docker e **todos** os canais caem.
+> Cada canal ligado também usa até `MAX_PARALLEL_DOWNLOADS` (2) conexões com a fonte, e muitos
+> provedores limitam conexões simultâneas por conta.
+> Para reduzir o risco: deixe os canais em "Sob demanda" com desligamento curto (30 s–3 min), aumente o
+> `mem_limit` conforme o número de canais que costumam ficar ligados juntos, ou defina
+> `MAX_CHANNELS` no `.env` para voltar a ter um teto.
+
 | Endereço | O que é |
 |---|---|
 | `http://IP:8099/admin` | **painel**: adicionar e remover canais; nome, URL, atraso, conexões e "Fixar servidor" de cada um; ligar, desligar e reiniciar |
