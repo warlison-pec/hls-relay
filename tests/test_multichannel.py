@@ -208,6 +208,12 @@ class MultiChannelTests(unittest.TestCase):
                         self.assertIn(body, b_payloads)
             time.sleep(1)
 
+    def test_no_limit_by_default(self):
+        self.assertEqual(self.manager.base.max_channels, 0)
+        slots = [self.add(name=f"C{i}") for i in range(12)]
+        self.assertEqual(len(set(slots)), 12)
+        self.assertEqual(len(self.manager.specs), 13)
+
     def test_add_remove_limit_and_no_reuse(self):
         self.manager.base.max_channels = 3
         self.assertEqual(self.add(name="B", url=self.b.source_url), 2)

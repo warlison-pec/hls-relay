@@ -12,7 +12,7 @@ O diagnóstico completo da v0.3 (causas confirmadas × hipóteses, com funções
 
 ## Multicanal e painel web (v0.5)
 
-O relay agora mantém **vários canais** (até 8 por padrão; `MAX_CHANNELS` no `.env` aceita até 32), cada um com o mesmo motor da v0.4: reserva/atraso,
+O relay agora mantém **vários canais** (sem limite de cadastro por padrão; `MAX_CHANNELS` no `.env` define um teto, 0 = ilimitado), cada um com o mesmo motor da v0.4: reserva/atraso,
 recomposição, validação de segmentos e renovação de token. Os canais são independentes: se a
 fonte de um cair, os outros seguem normalmente.
 

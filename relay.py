@@ -134,7 +134,7 @@ class Config:
     log_format: str = "text"
     log_level: str = "INFO"
     log_segments: bool = True
-    max_channels: int = 8                 # channels that can be registered in /admin
+    max_channels: int = 0                 # channels that can be registered in /admin; 0 = unlimited
     demand_idle_minutes: float = 20.0     # on-demand channels stop after this long without clients
     slate_dir: str = ""                   # "please wait" video for on-demand channels; empty = off
 
@@ -185,7 +185,7 @@ class Config:
             log_format=(env.get("LOG_FORMAT") or "text").strip().lower(),
             log_level=(env.get("LOG_LEVEL") or "INFO").strip().upper(),
             log_segments=_bool(env, "LOG_SEGMENTS", True),
-            max_channels=_num(env, "MAX_CHANNELS", 8, int, 1, 32),
+            max_channels=_num(env, "MAX_CHANNELS", 0, int, 0, 9999),
             demand_idle_minutes=_num(env, "DEMAND_IDLE_MINUTES", 20.0, float, 0.5, 1440.0),
             slate_dir=(env.get("SLATE_DIR") or "").strip(),
         )
@@ -2084,7 +2084,7 @@ class ChannelManager:
     def add(self, data: dict | None = None) -> int:
         clean = self._validate(data or {})
         with self.lock:
-            if len(self.specs) >= self.base.max_channels:
+            if self.base.max_channels and len(self.specs) >= self.base.max_channels:
                 raise ValueError(f"Limite de {self.base.max_channels} canais (MAX_CHANNELS no .env)")
             slot = self.next_id
             self.next_id += 1
@@ -2544,9 +2544,10 @@ function render() {
     update(el, c);
   }
   const n = data.channels.length, max = data.max_channels;
-  $('#count').textContent = `${n} de ${max} canais · ${data.channels.filter(c => c.running).length} ligado(s)`;
-  $('#addBtn').disabled = n >= max;
-  $('#addBtn').title = n >= max ? 'Limite atingido (MAX_CHANNELS no .env)' : '';
+  const full = max > 0 && n >= max;
+  $('#count').textContent = `${n}${max > 0 ? ' de ' + max : ''} canais · ${data.channels.filter(c => c.running).length} ligado(s)`;
+  $('#addBtn').disabled = full;
+  $('#addBtn').title = full ? 'Limite atingido (MAX_CHANNELS no .env)' : '';
   $('#empty').style.display = n ? 'none' : 'block';
 }
 
@@ -2645,10 +2646,10 @@ class RelayHTTPServer(ThreadingHTTPServer):
            detail=safe_text(exc))
 
 
-_CH_RE = re.compile(r"/ch/(\d{1,4})/(live\.m3u8|live\.m3u|health)")
+_CH_RE = re.compile(r"/ch/(\d{1,6})/(live\.m3u8|live\.m3u|health)")
 _SLATE_RE = re.compile(r"/slate/(\d{1,4})\.ts")
 _SLATE_SEQ_RE = re.compile(r"/slate/([0-9a-f]{6})-(\d{1,20})\.ts")
-_API_RE = re.compile(r"/api/channels/(\d{1,4})(?:/(start|stop|restart|delete))?")
+_API_RE = re.compile(r"/api/channels/(\d{1,6})(?:/(start|stop|restart|delete))?")
 
 
 class Handler(BaseHTTPRequestHandler):
