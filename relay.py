@@ -186,7 +186,7 @@ class Config:
             log_level=(env.get("LOG_LEVEL") or "INFO").strip().upper(),
             log_segments=_bool(env, "LOG_SEGMENTS", True),
             max_channels=_num(env, "MAX_CHANNELS", 8, int, 1, 32),
-            demand_idle_minutes=_num(env, "DEMAND_IDLE_MINUTES", 20.0, float, 1.0, 1440.0),
+            demand_idle_minutes=_num(env, "DEMAND_IDLE_MINUTES", 20.0, float, 0.5, 1440.0),
             slate_dir=(env.get("SLATE_DIR") or "").strip(),
         )
         return cfg.normalize()
@@ -1908,7 +1908,7 @@ class ChannelManager:
         opt("live_delay_seconds", float, 0.0, 1800.0)
         opt("max_parallel_downloads", int, 1, 4)
         opt("master_refresh_seconds", float, 0.0, 86400.0)
-        opt("idle_stop_minutes", float, 1.0, 1440.0)
+        opt("idle_stop_minutes", float, 0.5, 1440.0)
         if "mode" in data:
             mode = str(data["mode"] or "always").strip()
             if mode not in MODES:
@@ -2027,7 +2027,7 @@ class ChannelManager:
                 ev("channel_idle_stop", ch=slot, idle_min=round(idle / 60, 1))
                 self.stop(slot, persist=False, reason="idle")
 
-    def start_reaper(self, interval=30.0):
+    def start_reaper(self, interval=10.0):
         def loop():
             while not self.stop_event.wait(interval):
                 try:
@@ -2306,10 +2306,10 @@ function card(c) {
     <span class="dirty">alterações não salvas</span><span class="err"></span><button class="remove">Remover</button></div>`;
   const d = data.defaults || {};
   const opt = (sel, items) => { for (const [v, t] of items) { const o = document.createElement('option'); o.value = v; o.textContent = t; sel.appendChild(o); } };
-  opt($('.delay', el), [['', 'Padrão do .env (' + delayLabel(d.live_delay_seconds) + ')'], ['0', 'Sem atraso'], ['60', '1 minuto'], ['120', '2 minutos'], ['180', '3 minutos'], ['300', '5 minutos'], ['600', '10 minutos']]);
+  opt($('.delay', el), [['', 'Padrão do .env (' + delayLabel(d.live_delay_seconds) + ')'], ['0', 'Sem atraso'], ['30', '30 segundos'], ['60', '1 minuto'], ['120', '2 minutos'], ['180', '3 minutos'], ['300', '5 minutos'], ['600', '10 minutos']]);
   opt($('.par', el), [['', 'Padrão do .env (' + (d.max_parallel_downloads ?? '–') + ')'], ['1', '1'], ['2', '2'], ['3', '3'], ['4', '4']]);
   opt($('.mode', el), [['always', 'Sempre ligado (liga/desliga no painel)'], ['on_demand', 'Sob demanda (liga quando alguém pedir)']]);
-  opt($('.idle', el), [['', 'Padrão do .env (' + (d.idle_stop_minutes ?? 20) + ' min)'], ['5', '5 min'], ['10', '10 min'], ['20', '20 min'], ['30', '30 min'], ['60', '1 hora'], ['180', '3 horas']]);
+  opt($('.idle', el), [['', 'Padrão do .env (' + (d.idle_stop_minutes ?? 20) + ' min)'], ['0.5', '30 s'], ['1', '1 min'], ['2', '2 min'], ['3', '3 min'], ['5', '5 min'], ['10', '10 min'], ['20', '20 min'], ['30', '30 min'], ['60', '1 hora'], ['180', '3 horas']]);
   const syncIdle = () => { $('.idle', el).disabled = $('.mode', el).value !== 'on_demand'; };
   $('.mode', el).addEventListener('change', syncIdle); el._syncIdle = syncIdle;
   const mark = () => { dirty[c.slot] = true; $('.dirty', el).style.display = 'inline'; };
@@ -2334,9 +2334,9 @@ function fillForm(el, c) {
     o.textContent = delayLabel(c.live_delay_seconds); $('.delay', el).appendChild(o); $('.delay', el).value = o.value; }
   $('.par', el).value = c.max_parallel_downloads == null ? '' : String(c.max_parallel_downloads);
   $('.mode', el).value = c.mode || 'always';
-  $('.idle', el).value = c.idle_stop_minutes == null ? '' : String(Math.round(c.idle_stop_minutes));
+  $('.idle', el).value = c.idle_stop_minutes == null ? '' : String(c.idle_stop_minutes);
   if (!$('.idle', el).value && c.idle_stop_minutes != null) {
-    const o = document.createElement('option'); o.value = String(Math.round(c.idle_stop_minutes));
+    const o = document.createElement('option'); o.value = String(c.idle_stop_minutes);
     o.textContent = o.value + ' min'; $('.idle', el).appendChild(o); $('.idle', el).value = o.value; }
   el._syncIdle && el._syncIdle();
   dirty[c.slot] = false; $('.dirty', el).style.display = 'none';
